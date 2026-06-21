@@ -49,9 +49,9 @@ data/processed/**/*.parquet
 data/processed/**/*.h5
 
 # ─── Model checkpoints ────────────────────────────────────────────────────────
-models/checkpoints/*.pt
-models/checkpoints/*.pth
-models/checkpoints/*.ckpt
+# models/checkpoints/*.pt
+# models/checkpoints/*.pth
+# models/checkpoints/*.ckpt
 
 # ─── Results / outputs ────────────────────────────────────────────────────────
 results/backtest_reports/*.html
