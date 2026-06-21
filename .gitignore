@@ -1,32 +1,87 @@
-# Prerequisites
-*.d
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# ─── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+.venv_linux/
+venv/
+env/
+.env/
+ENV/
 
-# Precompiled Headers
-*.gch
-*.pch
+# ─── Distribution / packaging ─────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+.eggs/
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
+# ─── Testing ──────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+nosetests.xml
+.tox/
 
-# Fortran module files
-*.mod
-*.smod
+# ─── Type checkers ────────────────────────────────────────────────────────────
+.mypy_cache/
+.pytype/
+.pyre/
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+# ─── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
 
-# Executables
-*.exe
-*.out
-*.app
+# ─── Data files (keep folder structure, ignore large binaries) ────────────────
+data/raw/**/*.csv
+data/raw/**/*.parquet
+data/raw/**/*.h5
+data/raw/**/*.hdf5
+data/processed/**/*.csv
+data/processed/**/*.parquet
+data/processed/**/*.h5
+
+# ─── Model checkpoints ────────────────────────────────────────────────────────
+models/checkpoints/*.pt
+models/checkpoints/*.pth
+models/checkpoints/*.ckpt
+
+# ─── Results / outputs ────────────────────────────────────────────────────────
+results/backtest_reports/*.html
+results/metrics/*.csv
+results/plots/*.png
+results/plots/*.pdf
+
+# ─── Editors & OS ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Secrets / credentials ────────────────────────────────────────────────────
+.env
+*.env
+secrets.yaml
+credentials.json
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+*.dwo
+.cache/
+Testing/
+
+# personal interview prep notes (not part of the project)
+Interview_*.md
