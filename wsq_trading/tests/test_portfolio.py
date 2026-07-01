@@ -224,3 +224,61 @@ class TestAllocateBacktest:
         assert set(w.index) == set(results.keys())
         assert abs(w.sum() - 1.0) < 1e-8
 
+
+
+# Quality-gate look-ahead fix
+
+class TestQualityGateLookahead:
+    @staticmethod
+    def _stub(ticker, ret):
+        from wsq_trading.backtest import BacktestResult
+        return BacktestResult(
+            ticker=ticker,
+            strategy_returns=ret,
+            positions=pd.Series(np.sign(ret), index=ret.index),
+            H_estimates=pd.Series(0.5, index=ret.index),
+            regimes=pd.Series([None] * len(ret), index=ret.index),
+            gross_returns=ret,
+        )
+
+    def _results(self):
+        rng = np.random.default_rng(42)
+        idx = pd.date_range("2015-01-01", periods=500)
+        g1 = pd.Series(rng.normal(0.001, 0.01, 500), index=idx)
+        g2 = pd.Series(rng.normal(0.001, 0.01, 500), index=idx)
+        # 'bad' is unprofitable on the train window but gets a large boost in
+        # the final (test) 100 days, lifting its FULL-sample Sharpe above 0.30.
+        bad = pd.Series(rng.normal(-0.002, 0.01, 500), index=idx)
+        bad.iloc[-100:] += 0.02
+        results = {
+            "g1": self._stub("g1", g1),
+            "g2": self._stub("g2", g2),
+            "bad": self._stub("bad", bad),
+        }
+        return results, idx
+
+    def test_train_cutoff_excludes_late_booster(self):
+        """With a train cutoff, 'bad' is gated out using train-only Sharpe."""
+        results, idx = self._results()
+        alloc = HRPAllocator(quality_sharpe_threshold=0.30)
+        w = alloc.allocate_backtest(results, train_end_date=idx[399])
+        assert w["bad"] == 0.0
+        assert w["g1"] > 0.0 and w["g2"] > 0.0
+
+    def test_full_sample_would_admit_late_booster(self):
+        """Without a cutoff, the full-sample Sharpe lets 'bad' through.
+
+        This is exactly the look-ahead the train cutoff removes.
+        """
+        results, _ = self._results()
+        alloc = HRPAllocator(quality_sharpe_threshold=0.30)
+        w = alloc.allocate_backtest(results)
+        assert w["bad"] > 0.0
+
+    def test_default_none_matches_legacy_full_sample(self):
+        """train_end_date=None must reproduce the original full-sample gate."""
+        results, _ = self._results()
+        alloc = HRPAllocator(quality_sharpe_threshold=0.30)
+        w_default = alloc.allocate_backtest(results)
+        w_none = alloc.allocate_backtest(results, train_end_date=None)
+        pd.testing.assert_series_equal(w_default, w_none)

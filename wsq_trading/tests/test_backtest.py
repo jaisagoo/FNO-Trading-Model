@@ -513,3 +513,140 @@ class TestComputeAll:
         m = compute_all(flat_returns)
         assert "turnover" not in m
 
+
+
+# Portfolio-level analytics: PortfolioMetrics / regime_attribution / cost_sensitivity
+
+from wsq_trading.backtest import (  # noqa: E402
+    PortfolioMetrics,
+    compute_portfolio_metrics,
+    cost_sensitivity,
+    regime_attribution,
+)
+from wsq_trading.constants import TRADING_DAYS_PER_YEAR  # noqa: E402
+
+
+def _stub_result(ticker: str, ret: pd.Series, regimes: pd.Series | None = None,
+                 positions: pd.Series | None = None,
+                 gross: pd.Series | None = None) -> BacktestResult:
+    """Build a minimal BacktestResult for analytics tests."""
+    if regimes is None:
+        regimes = pd.Series([None] * len(ret), index=ret.index)
+    if positions is None:
+        positions = pd.Series(np.sign(ret), index=ret.index)
+    if gross is None:
+        gross = ret
+    return BacktestResult(
+        ticker=ticker,
+        strategy_returns=ret,
+        positions=positions,
+        H_estimates=pd.Series(0.5, index=ret.index),
+        regimes=regimes,
+        gross_returns=gross,
+    )
+
+
+class TestRegimeAttribution:
+    def test_frac_bars_sums_to_one_per_ticker(self) -> None:
+        """Fraction of bars across all regimes should sum to ~1 per ticker."""
+        idx = pd.bdate_range("2020-01-01", periods=300)
+        rng = np.random.default_rng(0)
+        ret = pd.Series(rng.normal(0.0, 0.01, 300), index=idx)
+        regimes = pd.Series(
+            rng.choice(list(Regime), size=300), index=idx
+        )
+        res = _stub_result("X", ret, regimes=regimes)
+        df = regime_attribution({"X": res})
+        assert abs(df.loc["X"]["frac_bars"].sum() - 1.0) < 1e-9
+
+    def test_portfolio_rows_present_with_weights(self) -> None:
+        idx = pd.bdate_range("2020-01-01", periods=300)
+        rng = np.random.default_rng(1)
+        regimes = pd.Series(rng.choice(list(Regime), size=300), index=idx)
+        results = {
+            "A": _stub_result("A", pd.Series(rng.normal(0, 0.01, 300), index=idx),
+                              regimes=regimes),
+            "B": _stub_result("B", pd.Series(rng.normal(0, 0.01, 300), index=idx),
+                              regimes=regimes),
+        }
+        weights = pd.Series({"A": 0.5, "B": 0.5})
+        df = regime_attribution(results, weights=weights)
+        assert "PORTFOLIO" in df.index.get_level_values("ticker")
+
+    def test_columns_present(self) -> None:
+        idx = pd.bdate_range("2020-01-01", periods=100)
+        rng = np.random.default_rng(2)
+        regimes = pd.Series(rng.choice(list(Regime), size=100), index=idx)
+        res = _stub_result("X", pd.Series(rng.normal(0, 0.01, 100), index=idx),
+                           regimes=regimes)
+        df = regime_attribution({"X": res})
+        for col in ("frac_bars", "ann_return", "sharpe", "n_obs"):
+            assert col in df.columns
+
+
+class TestCostSensitivity:
+    def _results(self):
+        engine = WalkForwardEngine(cost_bps=0)
+        data = _make_data(["AAPL", "MSFT"], n=500)
+        return engine.run(data)
+
+    def test_higher_cost_lower_or_equal_sharpe(self) -> None:
+        """portfolio_sharpe must be non-increasing as cost_bps increases."""
+        results = self._results()
+        weights = pd.Series({t: 1.0 / len(results) for t in results})
+        df = cost_sensitivity(results, weights)
+        sharpes = df["portfolio_sharpe"].to_numpy()
+        assert np.all(np.diff(sharpes) <= 1e-9)
+
+    def test_default_grid(self) -> None:
+        results = self._results()
+        weights = pd.Series({t: 1.0 / len(results) for t in results})
+        df = cost_sensitivity(results, weights)
+        assert list(df.index) == [0, 2, 5, 10, 20, 30]
+
+    def test_per_ticker_sharpe_columns(self) -> None:
+        results = self._results()
+        weights = pd.Series({t: 1.0 / len(results) for t in results})
+        df = cost_sensitivity(results, weights)
+        for t in results:
+            assert f"sharpe_{t}" in df.columns
+
+
+class TestPortfolioMetrics:
+    def test_alpha_beta_via_ols(self) -> None:
+        """Alpha and beta from OLS should match an exact linear relationship."""
+        idx = pd.bdate_range("2020-01-01", periods=300)
+        rng = np.random.default_rng(3)
+        bench = pd.Series(rng.normal(0.0, 0.01, 300), index=idx)
+        a, b = 0.0003, 1.5
+        port = a + b * bench  # exact linear -> OLS recovers (a, b)
+        res = _stub_result(
+            "P", port,
+            positions=pd.Series(np.zeros(300), index=idx),
+            gross=bench,
+        )
+        pm = compute_portfolio_metrics(
+            {"P": res}, pd.Series({"P": 1.0}),
+            benchmark_returns=bench, cost_bps=2.0,
+        )
+        assert isinstance(pm, PortfolioMetrics)
+        assert abs(pm.beta - b) < 1e-6
+        assert abs(pm.alpha - a * TRADING_DAYS_PER_YEAR) < 1e-6
+        assert pm.total_cost_bps == 2.0
+
+    def test_alpha_beta_nan_without_benchmark(self) -> None:
+        idx = pd.bdate_range("2020-01-01", periods=200)
+        rng = np.random.default_rng(4)
+        ret = pd.Series(rng.normal(0.0005, 0.01, 200), index=idx)
+        res = _stub_result("P", ret)
+        pm = compute_portfolio_metrics({"P": res}, pd.Series({"P": 1.0}))
+        assert np.isnan(pm.alpha) and np.isnan(pm.beta)
+        assert np.isnan(pm.information_ratio)
+
+    def test_n_obs_matches_return_length(self) -> None:
+        idx = pd.bdate_range("2020-01-01", periods=150)
+        rng = np.random.default_rng(5)
+        ret = pd.Series(rng.normal(0.0, 0.01, 150), index=idx)
+        res = _stub_result("P", ret)
+        pm = compute_portfolio_metrics({"P": res}, pd.Series({"P": 1.0}))
+        assert pm.n_obs == 150

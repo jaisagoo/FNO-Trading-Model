@@ -611,3 +611,257 @@ class WalkForwardEngine:
         scalar = (config.TARGET_VOL / realized_vol).clip(self._vol_floor_scalar, self._vol_cap_scalar)
         return (positions * scalar).clip(-1.0, 1.0)
 
+
+
+# Portfolio-level analytics
+
+@dataclass
+class PortfolioMetrics:
+    """Aggregate statistics for the HRP-weighted portfolio.
+
+    Attributes
+    ----------
+    sharpe : float
+        Annualised Sharpe ratio of the weighted portfolio return.
+    sortino : float
+        Annualised Sortino ratio.
+    annualized_return : float
+        Compound annualised portfolio return.
+    annualized_vol : float
+        Annualised volatility of the portfolio return.
+    max_drawdown : float
+        Maximum peak-to-trough drawdown (positive fraction).
+    calmar : float
+        Annualised return divided by max drawdown.
+    win_rate : float
+        Fraction of positive-return days.
+    turnover : float
+        Weight-weighted average instrument turnover (annualised).
+    total_cost_bps : float
+        Round-trip cost assumption used for the run (bps), or NaN.
+    alpha : float
+        CAPM alpha vs the benchmark (annualised); NaN if no benchmark.
+    beta : float
+        CAPM beta vs the benchmark; NaN if no benchmark.
+    information_ratio : float
+        Annualised active return divided by tracking error; NaN if no benchmark.
+    n_obs : int
+        Number of portfolio return observations.
+    """
+
+    sharpe: float
+    sortino: float
+    annualized_return: float
+    annualized_vol: float
+    max_drawdown: float
+    calmar: float
+    win_rate: float
+    turnover: float
+    total_cost_bps: float
+    alpha: float
+    beta: float
+    information_ratio: float
+    n_obs: int
+
+
+def compute_portfolio_metrics(
+    results: dict[str, BacktestResult],
+    weights: pd.Series,
+    benchmark_returns: pd.Series | None = None,
+    cost_bps: float | None = None,
+) -> PortfolioMetrics:
+    """Combine per-instrument results into a portfolio-level performance summary.
+
+    Parameters
+    ----------
+    results : dict[str, BacktestResult]
+        Per-instrument backtest results.
+    weights : pd.Series
+        HRP weights (index = ticker).
+    benchmark_returns : pd.Series, optional
+        Daily benchmark returns for alpha/beta/IR calculation.  If ``None``,
+        ``alpha``, ``beta`` and ``information_ratio`` are returned as NaN.
+    cost_bps : float, optional
+        Transaction cost assumption recorded on the result (``total_cost_bps``).
+
+    Returns
+    -------
+    PortfolioMetrics
+        Aggregate statistics for the weighted portfolio.
+    """
+    # Align strategy returns on a common date index
+    returns_df = pd.DataFrame(
+        {t: r.strategy_returns for t, r in results.items()}
+    ).dropna(how="all")
+
+    # Weighted portfolio return
+    w = weights.reindex(returns_df.columns).fillna(0.0)
+    port_returns = returns_df.mul(w, axis=1).sum(axis=1)
+
+    # Weighted turnover
+    turnover_total = sum(
+        float(weights.get(t, 0.0)) * float(r.metrics.get("turnover", 0.0))
+        for t, r in results.items()
+    )
+
+    # Alpha / Beta via OLS against benchmark
+    alpha, beta, ir = _NAN, _NAN, _NAN
+    if benchmark_returns is not None:
+        bench = benchmark_returns.reindex(port_returns.index).dropna()
+        port_aligned = port_returns.reindex(bench.index).dropna()
+        bench = bench.reindex(port_aligned.index)
+        if len(port_aligned) > 30:
+            X = np.column_stack([np.ones(len(bench)), bench.to_numpy()])
+            y = port_aligned.to_numpy()
+            coeffs = np.linalg.lstsq(X, y, rcond=None)[0]
+            alpha_daily, beta = float(coeffs[0]), float(coeffs[1])
+            alpha = alpha_daily * TRADING_DAYS_PER_YEAR
+            active = port_aligned - bench
+            te = float(active.std(ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR))
+            ir = (
+                float(active.mean() * TRADING_DAYS_PER_YEAR / te) if te > 0 else _NAN
+            )
+
+    metrics = compute_all(port_returns)
+    return PortfolioMetrics(
+        sharpe=metrics["sharpe"],
+        sortino=metrics["sortino"],
+        annualized_return=metrics["annualized_return"],
+        annualized_vol=metrics["annualized_vol"],
+        max_drawdown=metrics["max_drawdown"],
+        calmar=metrics["calmar"],
+        win_rate=metrics["win_rate"],
+        turnover=turnover_total,
+        total_cost_bps=cost_bps if cost_bps is not None else _NAN,
+        alpha=alpha,
+        beta=beta,
+        information_ratio=ir,
+        n_obs=len(port_returns),
+    )
+
+
+def regime_attribution(
+    results: dict[str, BacktestResult],
+    weights: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Decompose strategy returns by Hurst regime.
+
+    For each instrument (and optionally the HRP-weighted portfolio), compute the
+    fraction of bars spent in each regime, the annualised return and Sharpe while
+    in that regime, and the number of observations.
+
+    Parameters
+    ----------
+    results : dict[str, BacktestResult]
+        Per-instrument backtest results.
+    weights : pd.Series, optional
+        If provided, also compute portfolio-level attribution under the row
+        label ``'PORTFOLIO'``.
+
+    Returns
+    -------
+    pd.DataFrame
+        MultiIndex rows ``(ticker, regime)``; columns ``frac_bars``,
+        ``ann_return``, ``sharpe``, ``n_obs``.
+    """
+    rows = []
+    for ticker, res in results.items():
+        for regime in Regime:
+            mask = res.regimes == regime
+            r = res.strategy_returns[mask].dropna()
+            n = len(r)
+            rows.append({
+                "ticker": ticker,
+                "regime": regime.name,
+                "frac_bars": mask.sum() / max(len(res.regimes), 1),
+                "ann_return": annualized_return(r) if n > 5 else _NAN,
+                "sharpe": sharpe_ratio(r) if n > 5 else _NAN,
+                "n_obs": n,
+            })
+
+    # Portfolio-level attribution
+    if weights is not None:
+        returns_df = pd.DataFrame({t: r.strategy_returns for t, r in results.items()})
+        regimes_df = pd.DataFrame({t: r.regimes for t, r in results.items()})
+        w = weights.reindex(returns_df.columns).fillna(0.0)
+        port_returns = returns_df.mul(w, axis=1).sum(axis=1)
+
+        # Regime of portfolio = weighted-exposure majority across instruments.
+        for regime in Regime:
+            regime_mask = regimes_df.apply(lambda col: col == regime)
+            weighted_mask = regime_mask.mul(w, axis=1).sum(axis=1)
+            total_weight = (
+                regimes_df.notna().mul(w, axis=1).sum(axis=1).replace(0, _NAN)
+            )
+            dominant = (weighted_mask / total_weight) > 0.5
+            r = port_returns[dominant].dropna()
+            n = len(r)
+            rows.append({
+                "ticker": "PORTFOLIO",
+                "regime": regime.name,
+                "frac_bars": dominant.sum() / max(len(port_returns), 1),
+                "ann_return": annualized_return(r) if n > 5 else _NAN,
+                "sharpe": sharpe_ratio(r) if n > 5 else _NAN,
+                "n_obs": n,
+            })
+
+    df = pd.DataFrame(rows).set_index(["ticker", "regime"])
+    return df
+
+
+def cost_sensitivity(
+    results: dict[str, BacktestResult],
+    weights: pd.Series,
+    cost_bps_grid: list[float] | None = None,
+) -> pd.DataFrame:
+    """Re-price strategy returns at a range of round-trip transaction costs.
+
+    The function does NOT re-run the signal generator.  It takes each
+    instrument's existing position series and gross instrument returns and
+    subtracts cost at each cost level, then re-weights into a portfolio.
+
+    Parameters
+    ----------
+    results : dict[str, BacktestResult]
+        Per-instrument backtest results.
+    weights : pd.Series
+        HRP weights (index = ticker).
+    cost_bps_grid : list[float], optional
+        Round-trip costs in bps to evaluate.  Default ``[0, 2, 5, 10, 20, 30]``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Index ``cost_bps``; columns ``portfolio_sharpe``,
+        ``portfolio_ann_return``, ``portfolio_max_drawdown`` plus one
+        ``sharpe_<ticker>`` column per instrument.
+    """
+    if cost_bps_grid is None:
+        cost_bps_grid = [0, 2, 5, 10, 20, 30]
+
+    w = weights.reindex([t for t in results]).fillna(0.0)
+    rows = []
+    for cost_bps in cost_bps_grid:
+        cost_rate = cost_bps / 10_000
+        repriced: dict[str, pd.Series] = {}
+        ticker_sharpes: dict[str, float] = {}
+        for ticker, res in results.items():
+            gross_strat = res.positions * res.gross_returns
+            position_changes = res.positions.diff().abs().fillna(0.0)
+            net = gross_strat - position_changes * cost_rate
+            repriced[ticker] = net
+            ticker_sharpes[ticker] = sharpe_ratio(net)
+
+        returns_df = pd.DataFrame(repriced).dropna(how="all")
+        port = returns_df.mul(w.reindex(returns_df.columns).fillna(0.0), axis=1).sum(axis=1)
+
+        row = {
+            "cost_bps": cost_bps,
+            "portfolio_sharpe": sharpe_ratio(port),
+            "portfolio_ann_return": annualized_return(port),
+            "portfolio_max_drawdown": max_drawdown(port),
+        }
+        row.update({f"sharpe_{t}": s for t, s in ticker_sharpes.items()})
+        rows.append(row)
+
+    return pd.DataFrame(rows).set_index("cost_bps")

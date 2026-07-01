@@ -10,13 +10,21 @@ signals, sizes positions with HRP, and runs the walk-forward backtest.
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
 import pandas as pd
 
 from wsq_trading import config
-from wsq_trading.backtest import BacktestResult, WalkForwardEngine
+from wsq_trading.backtest import (
+    BacktestResult,
+    WalkForwardEngine,
+    compute_all,
+    compute_portfolio_metrics,
+    cost_sensitivity,
+    regime_attribution,
+)
 from wsq_trading.data import DataCleaner, DataLoader, DataValidator
 from wsq_trading.features import FeatureEngineer
 from wsq_trading.portfolio import HRPAllocator
@@ -31,6 +39,40 @@ try:
     _FNO_AVAILABLE = True
 except ImportError:
     _FNO_AVAILABLE = False
+
+
+@dataclass
+class OOSReport:
+    """True out-of-sample evaluation report.
+
+    Attributes
+    ----------
+    train_end : pd.Timestamp
+        Last date of the train+val window.
+    test_start : pd.Timestamp
+        First date of the pure test window.
+    test_end : pd.Timestamp
+        Last date of the test window.
+    per_instrument : pd.DataFrame
+        Index = ticker, columns = OOS (test-period) metrics.
+    portfolio : dict[str, float]
+        Portfolio-level OOS metrics (from :class:`PortfolioMetrics`).
+    hrp_weights : pd.Series
+        HRP weights computed from the train window only.
+    regime_attribution : pd.DataFrame
+        Test-period P&L decomposed by Hurst regime.
+    cost_sensitivity : pd.DataFrame
+        Test-period Sharpe / return / drawdown at a grid of cost levels.
+    """
+
+    train_end: pd.Timestamp
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+    per_instrument: pd.DataFrame
+    portfolio: dict[str, float]
+    hrp_weights: pd.Series
+    regime_attribution: pd.DataFrame
+    cost_sensitivity: pd.DataFrame
 
 
 class Pipeline:
@@ -134,19 +176,24 @@ class Pipeline:
     def allocate(
         self,
         results: dict[str, BacktestResult],
+        train_end_date: pd.Timestamp | str | None = None,
     ) -> pd.Series:
         """Compute HRP weights from backtest strategy returns.
 
         Parameters
         ----------
         results : dict[str, BacktestResult]
+            Per-instrument backtest results.
+        train_end_date : pd.Timestamp or str, optional
+            Forwarded to :meth:`HRPAllocator.allocate_backtest` so the quality
+            gate only sees returns up to this date (avoids look-ahead).
 
         Returns
         -------
         pd.Series
             Ticker -> HRP weight (sum to 1).
         """
-        return self.allocator.allocate_backtest(results)
+        return self.allocator.allocate_backtest(results, train_end_date=train_end_date)
 
     def summary(
         self,
@@ -176,18 +223,239 @@ class Pipeline:
         tickers: list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
-    ) -> tuple[dict[str, BacktestResult], pd.Series, pd.DataFrame]:
-        """One-shot convenience: run -> allocate -> summarise."""
+        oos: bool = False,
+    ) -> tuple[dict[str, BacktestResult], pd.Series, pd.DataFrame] | OOSReport:
+        """One-shot convenience: run -> allocate -> summarise.
+
+        Parameters
+        ----------
+        tickers : list[str], optional
+            Instruments to trade.  Default: ``config.TICKERS``.
+        start, end : str, optional
+            ISO date strings for the historical range.
+        oos : bool
+            If ``True``, route to :meth:`run_oos` and return an
+            :class:`OOSReport` instead of the ``(results, weights, summary)``
+            tuple.  Default ``False`` (backward compatible).
+
+        Returns
+        -------
+        tuple[dict[str, BacktestResult], pd.Series, pd.DataFrame] or OOSReport
+            The three-tuple when ``oos=False``; an :class:`OOSReport` otherwise.
+        """
+        if oos:
+            return self.run_oos(tickers=tickers, start=start, end=end)
+
         results = self.run(tickers=tickers, start=start, end=end)
         if not results:
             empty = pd.Series(dtype=float)
             return results, empty, pd.DataFrame()
 
-        weights = self.allocate(results)
+        # Compute the train cutoff from config.TRAIN_SPLIT and the data date
+        # range so the quality gate does not use the (held-out) tail of history.
+        train_end = self._date_at_fraction(results, config.TRAIN_SPLIT)
+        weights = self.allocate(results, train_end_date=train_end)
         summary = self.summary(results, weights)
         return results, weights, summary
 
+    def run_oos(
+        self,
+        tickers: list[str] | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> OOSReport:
+        """Run a clean out-of-sample evaluation.
+
+        Signal generation uses the full return series (Hurst estimation needs
+        warm-up history), but every reported metric is computed on the pure test
+        window only.  The HRP weights and quality gate are derived from the
+        train+val window so the test period never influences allocation.
+
+        Parameters
+        ----------
+        tickers : list[str], optional
+            Instruments to trade.  Default: ``config.TICKERS``.
+        start, end : str, optional
+            ISO date strings for the historical range.
+
+        Returns
+        -------
+        OOSReport
+            Out-of-sample per-instrument, portfolio, regime, and cost results.
+
+        Raises
+        ------
+        ValueError
+            If no usable data is available or no ticker backtests successfully.
+        """
+        tickers = tickers or config.TICKERS
+        start = start or config.DEFAULT_START
+        end = end or config.DEFAULT_END
+
+        log.info("Pipeline.run_oos: %d tickers  %s -> %s", len(tickers), start, end)
+
+        with timer("Pipeline.run_oos: data loading + cleaning"):
+            data = self._load_and_clean(tickers, start, end)
+        if not data:
+            raise ValueError("No usable data after cleaning; cannot run OOS evaluation.")
+
+        # Signals run on FULL history; metrics are sliced to the test window below.
+        with timer("Pipeline.run_oos: backtest"):
+            results = self._engine.run(data)
+        if not results:
+            raise ValueError("No tickers backtested successfully; cannot run OOS.")
+
+        # Date-based split using the union of all instrument dates.
+        all_dates = sorted(set().union(*[r.strategy_returns.index for r in results.values()]))
+        n = len(all_dates)
+        train_val_n = int(n * (config.TRAIN_SPLIT + config.VAL_SPLIT))
+        train_val_n = min(max(train_val_n, 1), n - 1)
+        train_end = pd.Timestamp(all_dates[train_val_n - 1])
+        test_start = pd.Timestamp(all_dates[train_val_n])
+        test_end = pd.Timestamp(all_dates[-1])
+        log.info(
+            "OOS split: train_end=%s  test=[%s .. %s]",
+            train_end.date(), test_start.date(), test_end.date(),
+        )
+
+        # Weights from train window only: gate AND weights see no test data.
+        train_results = {
+            t: self._slice_result(r, None, train_end) for t, r in results.items()
+        }
+        hrp_weights = self.allocate(train_results, train_end_date=train_end)
+
+        # OOS metrics: slice every series to the pure test window.
+        oos_results = {
+            t: self._slice_result(r, test_start, test_end) for t, r in results.items()
+        }
+
+        per_rows = {
+            t: compute_all(r.strategy_returns, positions=r.positions)
+            for t, r in oos_results.items()
+        }
+        per_instrument = pd.DataFrame(per_rows).T
+        per_instrument["hrp_weight"] = hrp_weights.reindex(per_instrument.index)
+
+        # Equity benchmark for alpha/beta/IR: ES=F gross returns where available.
+        benchmark = (
+            oos_results["ES=F"].gross_returns if "ES=F" in oos_results else None
+        )
+
+        port = compute_portfolio_metrics(
+            oos_results, hrp_weights, benchmark_returns=benchmark, cost_bps=self.cost_bps
+        )
+        attribution = regime_attribution(oos_results, hrp_weights)
+        costs = cost_sensitivity(oos_results, hrp_weights)
+
+        return OOSReport(
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+            per_instrument=per_instrument,
+            portfolio=asdict(port),
+            hrp_weights=hrp_weights,
+            regime_attribution=attribution,
+            cost_sensitivity=costs,
+        )
+
+    def print_oos_report(self, report: OOSReport) -> None:
+        """Log a formatted summary of an :class:`OOSReport`.
+
+        Parameters
+        ----------
+        report : OOSReport
+            The report produced by :meth:`run_oos`.
+        """
+        p = report.portfolio
+        lines = [
+            "",
+            "=== OUT-OF-SAMPLE REPORT ===",
+            f"Train+Val window: ... -> {report.train_end.date()}",
+            f"Test window:      {report.test_start.date()} -> {report.test_end.date()}",
+            "",
+            "--- Portfolio (OOS) ---",
+            f"Sharpe:           {p['sharpe']:.3f}",
+            f"Annual Return:    {p['annualized_return']:.1%}",
+            f"Annual Vol:       {p['annualized_vol']:.1%}",
+            f"Max Drawdown:     {p['max_drawdown']:.1%}",
+            f"Calmar:           {p['calmar']:.3f}",
+            f"Turnover (ann):   {p['turnover']:.2f}x",
+            f"Alpha vs ES=F:    {p['alpha']:.1%}",
+            f"Beta vs ES=F:     {p['beta']:.3f}",
+            f"Info Ratio:       {p['information_ratio']:.3f}",
+            "",
+            "--- Per-Instrument (OOS) ---",
+            report.per_instrument.to_string(),
+            "",
+            "--- HRP Weights (from train window) ---",
+            report.hrp_weights.to_string(),
+            "",
+            "--- Regime Attribution ---",
+            report.regime_attribution.to_string(),
+            "",
+            "--- Cost Sensitivity ---",
+            report.cost_sensitivity.to_string(),
+        ]
+        log.info("\n".join(lines))
+
     # Internal helpers
+
+    @staticmethod
+    def _date_at_fraction(
+        results: dict[str, BacktestResult],
+        fraction: float,
+    ) -> pd.Timestamp:
+        """Return the date at ``fraction`` of the union of all result dates.
+
+        Parameters
+        ----------
+        results : dict[str, BacktestResult]
+            Per-instrument backtest results.
+        fraction : float
+            Fraction in (0, 1] of the history to include up to the cutoff.
+
+        Returns
+        -------
+        pd.Timestamp
+            The cutoff date (inclusive).
+        """
+        all_dates = sorted(set().union(*[r.strategy_returns.index for r in results.values()]))
+        n = len(all_dates)
+        idx = min(max(int(n * fraction) - 1, 0), n - 1)
+        return pd.Timestamp(all_dates[idx])
+
+    @staticmethod
+    def _slice_result(
+        res: BacktestResult,
+        start: pd.Timestamp | None,
+        end: pd.Timestamp | None,
+    ) -> BacktestResult:
+        """Return a copy of ``res`` with all series sliced to ``[start, end]``.
+
+        Metrics are recomputed from the sliced series by
+        ``BacktestResult.__post_init__``, giving window-local statistics.
+
+        Parameters
+        ----------
+        res : BacktestResult
+            Source result spanning the full history.
+        start, end : pd.Timestamp or None
+            Inclusive date bounds; ``None`` means open-ended on that side.
+
+        Returns
+        -------
+        BacktestResult
+            Result restricted to the requested window.
+        """
+        sl = slice(start, end)
+        return BacktestResult(
+            ticker=res.ticker,
+            strategy_returns=res.strategy_returns.loc[sl],
+            positions=res.positions.loc[sl],
+            H_estimates=res.H_estimates.loc[sl],
+            regimes=res.regimes.loc[sl],
+            gross_returns=res.gross_returns.loc[sl],
+        )
 
     def _load_and_clean(
         self,

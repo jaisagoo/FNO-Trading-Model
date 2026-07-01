@@ -122,10 +122,11 @@ class HRPAllocator:
     def allocate_backtest(
         self,
         results: "dict[str, BacktestResult]",  # type: ignore[name-defined]
+        train_end_date: "pd.Timestamp | str | None" = None,
     ) -> pd.Series:
         """Convenience wrapper: extract strategy returns, apply quality gate, then HRP.
 
-        Instruments whose full-sample annualised strategy Sharpe is below
+        Instruments whose annualised strategy Sharpe is below
         ``quality_sharpe_threshold`` are excluded before running HRP.  The
         freed weight is redistributed proportionally among the survivors.
         Set ``quality_sharpe_threshold`` to ``-inf`` (or a very negative number)
@@ -139,6 +140,11 @@ class HRPAllocator:
         ----------
         results : dict[str, BacktestResult]
             Output of :meth:`WalkForwardEngine.run`.
+        train_end_date : pd.Timestamp or str, optional
+            If provided, the quality-gate Sharpe is computed only from returns
+            up to and including this date, avoiding look-ahead from the test
+            period.  The HRP weight computation (after filtering) still uses all
+            available returns -- only the *filter decision* is time-limited.
 
         Returns
         -------
@@ -150,12 +156,21 @@ class HRPAllocator:
             {ticker: res.strategy_returns for ticker, res in results.items()}
         )
 
+        # Restrict the quality-gate Sharpe window if a cutoff was supplied.
+        # HRP weights still use the full returns_df; only the gate decision
+        # is limited to the training window.
+        if train_end_date is not None:
+            cutoff = pd.Timestamp(train_end_date)
+            sharpe_returns = returns_df.loc[:cutoff]
+        else:
+            sharpe_returns = returns_df
+
         # Quality gate
         threshold = self.quality_sharpe_threshold
         if threshold > -1e9:  # effectively disabled if very negative
             sharpes: dict[str, float] = {}
-            for col in returns_df.columns:
-                r = returns_df[col].dropna()
+            for col in sharpe_returns.columns:
+                r = sharpe_returns[col].dropna()
                 if len(r) > 30 and r.std(ddof=1) > 0:
                     sharpes[col] = (r.mean() / r.std(ddof=1)) * np.sqrt(TRADING_DAYS_PER_YEAR)
                 else:
@@ -382,4 +397,3 @@ class HRPAllocator:
         if total > 0:
             w = w / total
         return w
-

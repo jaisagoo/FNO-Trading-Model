@@ -232,7 +232,6 @@ class TestRunAndSummarise:
         assert weights.empty
         assert summary.empty
 
-
 # Pipeline FNO mode  (skips if PyTorch not available)
 
 torch = pytest.importorskip("torch", reason="PyTorch not installed")
