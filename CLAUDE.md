@@ -28,7 +28,9 @@ wsq_trading/
     portfolio.py    HRP allocator
     backtest.py     walk-forward engine + metrics
     pipeline.py     orchestration
+    reporting.py    OOS results -> CSV + markdown report
     tests/          test_<module>.py
+scripts/            CLI entry points (backtest, OOS report, validation tuning, plotting)
 ```
 
 ## Conventions
@@ -45,7 +47,8 @@ wsq_trading/
 - Config-driven: change `config.py` to swap data sources, hyperparameters or thresholds.
 - Synthetic data first: real OHLCV is supplemented with rough-Heston SPDE paths so the
   FNO has enough labelled signal.
-- Regime thresholds: `H < 0.35` mean-reversion, `0.35–0.65` neutral, `H > 0.65` momentum.
+- Regime thresholds: `H < 0.43` mean-reversion, `0.43–0.57` neutral, `H > 0.57` momentum
+  (`HURST_ROUGH_THRESHOLD` / `HURST_TREND_THRESHOLD` in `config.py` are the source of truth).
 - HRP over mean-variance optimisation — more robust to estimation error out of sample.
 - The backtest engine enforces strict temporal splits (no look-ahead).
 

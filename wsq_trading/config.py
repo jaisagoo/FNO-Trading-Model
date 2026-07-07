@@ -244,7 +244,8 @@ VOL_CAP_SCALAR: float = 1.5      # allow up to 1.5× in low-vol trending regimes
 # Produces continuous fractional positions rather than binary ±1.
 # Works multiplicatively before vol-targeting: weak-signal bars get smaller
 # positions, reducing transaction costs and drawdown from false entries.
-H_CONVICTION_SIZING: bool = True    # enabled - scale by conviction then vol-target
+H_CONVICTION_SIZING: bool = False   # off since 2026-07: hurt validation-window Sharpe
+                                    # (see results/metrics/2026-07-07_validation_tuning.csv)
 H_CONVICTION_FLOOR: float = 0.15   # minimum scalar (was 0.20)
 
 

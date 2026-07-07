@@ -7,17 +7,17 @@ rough Heston model where H characterises the *variance* process roughness.
 A short rolling-std window proxies sqrt(V(t)); Whittle MLE is then applied to
 windows of log(sqrt(V)) to recover H.
 
-    H < HURST_ROUGH_THRESHOLD  (default 0.47)  ->  MEAN_REVERT
+    H < HURST_ROUGH_THRESHOLD  (default 0.43)  ->  MEAN_REVERT
         Signal: -sign(price_z_score)  when z_threshold < |z| < mr_z_upper_cap,
         else 0.  The upper cap guards against treating structural breaks as
         reversion opportunities.
 
-    H > HURST_TREND_THRESHOLD  (default 0.51)  ->  MOMENTUM
+    H > HURST_TREND_THRESHOLD  (default 0.57)  ->  MOMENTUM
         Signal: sign(fast_MA - slow_MA) when that direction is confirmed by
         the N-day rolling return momentum, else 0.  Requiring two independent
         direction signals materially reduces false entries.
 
-    Otherwise  (0.47 <= H <= 0.51)            ->  NEUTRAL
+    Otherwise  (0.43 <= H <= 0.57)            ->  NEUTRAL
         Signal: -sign(daily_return_z) * NEUTRAL_MR_POSITION_SIZE
         when |daily_return_z| > NEUTRAL_MR_ENTRY_ZSCORE, else 0.
         Turns dead neutral time into a short-term contrarian alpha source.
